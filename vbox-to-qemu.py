@@ -170,6 +170,8 @@ class Machine(object):
         for ext, dstdir in exts.items():
             src = "{}/{}.{}".format(isodir, name, ext)
             dst = "{}/{}.{}".format(dstdir, name, ext)
+            # TODO: edit inf files and comment out SourceDisksNames to avoid the
+            # prompt for insertion of a CD?
             self.copy_to_windir(src, dst)
 
     def copy_to_windir(self, src, dst, overwrite=False):
@@ -434,11 +436,18 @@ def main(win_disk_image, virtio_iso, win_iso, testing, overwrite_files,
         # 3 On-demand (by Service Control Manager)d
         # 4 Disable (by Service Control Manager)d
         mod_ccs.Services[service_name].Start = 4
+
+    # Disable processr.sys driver to avoid BSOD
+    cpu_inf = m.get_windir_path("inf/cpu.inf")
+    if m.g.exists(cpu_inf):
+        m.g.rename(cpu_inf, cpu_inf + ".bak")
+
     # Remove VBoxMouse from UpperFilters
     mse_cls_id = "{4D36E96F-E325-11CE-BFC1-08002BE10318}"
     mse_cls = mod_ccs.Control.Class[mse_cls_id]
     # TODO: maybe "remove" from list instead of overwrite?
     mse_cls.UpperFilters = ["mouclass"]
+
     # Increase resolution for fallback graphics adapter
     hp_ccs = ccs["Hardware Profiles"]["0001"].System.CurrentControlSet
     vgaSave_id = "{23A77BF7-ED96-40EC-AF06-9B1F4867732A}"
