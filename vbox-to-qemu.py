@@ -15,6 +15,7 @@ from tempfile import NamedTemporaryFile
 from copy import copy
 import argparse
 import logging
+import struct
 
 # TODO: callable fallback for Python 3.0 and 3.1
 
@@ -95,15 +96,18 @@ _WINDOWS_VERSIONS = {
 }
 
 class Machine(object):
-    def __init__(self, win_disk_image, virtio_iso_image):
+    def __init__(self, win_disk_image, virtio_iso_image, win_iso=None):
         """
         Adds the images as block devices, launches the machine and fetches some
         version information about the guest.
         """
         self.g = guestfs.GuestFS()
         self.g.add_drive(win_disk_image)
+        if win_iso:
+            self.g.add_drive_ro(win_iso)
         self.g.add_drive_ro(virtio_iso_image)
         self.g.launch()
+        self.win_root = "/win"
         self.win_blkroot = self._mount_block_devices()
         self.win_ver = "{}.{}".format(
             self.g.inspect_get_major_version(self.win_blkroot),
@@ -124,9 +128,12 @@ class Machine(object):
         # Assume that the virtio ISO is the most recently added device
         virtio_cd_rootdev = blockdevs[-1]
         images = [
-            (win_blkroot, "/win"),
+            (win_blkroot, self.win_root),
             (virtio_cd_rootdev, "/cd")
         ]
+        # Mount Windows installation CD if given
+        if len(blockdevs) >= 3:
+            images += [(blockdevs[-2], "/wincd")]
         for blockdev, mountpoint in images:
             self.g.mkmountpoint(mountpoint)
             self.g.mount(blockdev, mountpoint)
@@ -162,17 +169,24 @@ class Machine(object):
             isodir = "/cd/{}/{}".format(vio_win_name, arch)
         for ext, dstdir in exts.items():
             src = "{}/{}.{}".format(isodir, name, ext)
-            dst = self.get_windir_path("{}/{}.{}".format(dstdir, name, ext))
-            should_copy = not self.g.exists(dst)
-            if not should_copy and overwrite:
-                _logger.info("Overwriting existing {}".format(dst))
-                should_copy = True
-            if should_copy:
-                _logger.info("cp '{}' -> '{}'".format(src, dst))
-                self.g.cp(src, dst)
-            else:
-                _logger.info("Not copying '{}' to existing '{}'".format(
-                            src, dst))
+            dst = "{}/{}.{}".format(dstdir, name, ext)
+            self.copy_to_windir(src, dst)
+
+    def copy_to_windir(self, src, dst, overwrite=False):
+        """
+        Copies the file src to C:\\Windows\\dst.
+        """
+        src = self.g.case_sensitive_path(src)
+        dst = self.get_windir_path(dst)
+        should_copy = not self.g.exists(dst)
+        if not should_copy and overwrite:
+            _logger.info("Overwriting existing {}".format(dst))
+            should_copy = True
+        if should_copy:
+            _logger.info("cp '{}' -> '{}'".format(src, dst))
+            self.g.cp(src, dst)
+        else:
+            _logger.info("Not copying '{}' to existing '{}'".format(src, dst))
 
     def reg_get_ccs_name(self):
         """
@@ -207,7 +221,7 @@ class Machine(object):
                 handle.walk(self._import_callback, opaque)
             if modify_handle:
                 opaque = False, h, h.root(), "HKLM\\{}".format(hive)
-                handle.walk(self._import_callback, opaque)
+                modify_handle.walk(self._import_callback, opaque)
 
             h.commit(None)
             _logger.info("Updating registry {}".format(hive))
@@ -221,19 +235,25 @@ class Machine(object):
 
         create_missing, h, root, path = opaque
         path += "\\" + key
+        #_logger.debug("Checking {}, root {}, value {}".format(path, root, value))
         if isinstance(value, RegistryHandle):
             # value is a handle, return the handle matching this child
             node = h.node_get_child(root, key)
             if node is None:
                 if not create_missing:
+                    _logger.debug("Key {} is missing, skipping subkeys".format(
+                                path))
                     return None
                 node = h.node_add_child(root, key)
             # Promote the child node as new root for its children
             return create_missing, h, node, path
         else:
-            old_value = h.node_get_value(root, key)
-            if old_value:
+            try:
+                old_value = h.node_get_value(root, key)
                 old_type, old_data = h.value_value(old_value)
+            except:
+                # When the value is missing, node_get_value throws RE
+                old_value = None
             #if callable(value):
             #    _logger.debug("Calling {} for {}".format(value, path))
             #    value = value(h, path, old_value)
@@ -251,14 +271,18 @@ class Machine(object):
             elif isinstance(value, RegistryValue):
                 t = value.type()
                 value = value.value()
+            elif isinstance(value, list):
+                t = REG_MULTI_SZ
             else:
                 raise RuntimeError("Unknown type for {}={}".format(key, value))
 
             # Assume that strings are nul-terminated UTF-16 (LE)
             if not isinstance(value, bytes) and isinstance(value, str):
                 value = value.encode("utf-16-le") + b"\x00\x00"
+            elif isinstance(value, int):
+                # Convert DWORD to a byte s.t. the comparison below makes sense
+                value = struct.pack('<I', value)
             elif isinstance(value, list):
-                t = REG_MULTI_SZ
                 items, value = value, b''
                 # Assume UTF-16 (LE) Unicode strings
                 for item in items:
@@ -329,9 +353,9 @@ _svc = viostor.set_service("SCSI miniport", 0x40)
 # pnpsafe_pci_addreg
 _svc.Parameters.PnpInterface["5"] = 0x00000001
 _svc.Parameters.BusType = 0x00000001
-_svc.Enum["0"] = "PCI\\VEN_1AF4&DEV_1001&SUBSYS_00021AF4&REV_00\\3&13c0b0c5&2&20"
-_svc.Enum.Count = 0x00000001
-_svc.Enum.NextInstance = 0x00000001
+#_svc.Enum["0"] = "PCI\\VEN_1AF4&DEV_1001&SUBSYS_00021AF4&REV_00\\3&13c0b0c5&2&20"
+#_svc.Enum.Count = 0x00000001
+#_svc.Enum.NextInstance = 0x00000001
 #viostor.reg_system_ccs.Services.Disk.Enum["1"] = \
 #    "SCSI\\Disk&Ven_Red_Hat&Prod_VirtIO&Rev_0001\\4&35110308&0&000"
 #_ctrl = viostor.reg_system_ccs.Control.Class
@@ -355,23 +379,26 @@ _svc.BootFlags = 0x00000001
 _svc.TextModeFlags = 1
 _svc.Parameters.DisableMSI = 0
 _svc.Parameters.EarlyDebug = 3
-_svc.Enum["0"] = "PCI\\VEN_1AF4&DEV_1000&SUBSYS_00011AF4&REV_00\\3&13c0b0c5&2&18"
-_svc.Enum.Count = 0x00000001
-_svc.Enum.NextInstance = 0x00000001
+#_svc.Enum["0"] = "PCI\\VEN_1AF4&DEV_1000&SUBSYS_00011AF4&REV_00\\3&13c0b0c5&2&18"
+#_svc.Enum.Count = 0x00000001
+#_svc.Enum.NextInstance = 0x00000001
 
 
-def main(win_disk_image, virtio_iso, testing, overwrite_files):
+def main(win_disk_image, virtio_iso, win_iso, testing, overwrite_files,
+        extra_files):
     if not os.path.isfile(win_disk_image):
         raise ValueError("Disk image {} not found".format(win_disk_image))
     if not os.path.isfile(virtio_iso):
         raise ValueError("VirtIO iso image {} not found".format(virtio_iso))
+    if win_iso and not os.path.isfile(win_iso):
+        raise ValueError("Windows ISO image {} not found".format(win_iso))
 
-    m = Machine(win_disk_image, virtio_iso)
+    m = Machine(win_disk_image, virtio_iso, win_iso)
     _logger.info("Started machine {} (x64={})".format(m.win_ver, m.is_x64))
     #drivers = ["viostor", "netkvm", "vioscsi"]
     drivers = [
         viostor,
-#        netkvm
+        netkvm
     ]
     system_hive = RegistryHandle()
     ccs_name = m.reg_get_ccs_name()
@@ -379,6 +406,11 @@ def main(win_disk_image, virtio_iso, testing, overwrite_files):
     for driver in drivers:
         m.install_driver(driver.name, overwrite=overwrite_files)
         ccs += driver.reg_system_ccs
+
+    # Maybe get rid of some OEMxx.inf?
+    #inf_dir = m.get_windir_path("inf")
+
+    # TODO: find old OEMxx.inf drivers and get rid of them
 
     #import pprint
     #pprint.PrettyPrinter(indent=4).pprint(system_hive)
@@ -393,7 +425,7 @@ def main(win_disk_image, virtio_iso, testing, overwrite_files):
         "Processor",
     ]
     mod_system_hive = RegistryHandle()
-    mod_ccs_svc = mod_system_hive[ccs_name].Services
+    mod_ccs = mod_system_hive[ccs_name]
     for service_name in disable_services:
         # http://support.microsoft.com/kb/103000 Start values:
         # 0 Boot (by bootloader)
@@ -401,20 +433,31 @@ def main(win_disk_image, virtio_iso, testing, overwrite_files):
         # 2 Auto-load (by Service Control Manager)
         # 3 On-demand (by Service Control Manager)d
         # 4 Disable (by Service Control Manager)d
-        mod_ccs_svc[service_name].Start = 4
+        mod_ccs.Services[service_name].Start = 4
     # Remove VBoxMouse from UpperFilters
     mse_cls_id = "{4D36E96F-E325-11CE-BFC1-08002BE10318}"
-    mse_cls = mod_ccs_svc.Control.Class[mse_cls_id]
+    mse_cls = mod_ccs.Control.Class[mse_cls_id]
+    # TODO: maybe "remove" from list instead of overwrite?
     mse_cls.UpperFilters = ["mouclass"]
+    # Increase resolution for fallback graphics adapter
+    hp_ccs = ccs["Hardware Profiles"]["0001"].System.CurrentControlSet
+    vgaSave_id = "{23A77BF7-ED96-40EC-AF06-9B1F4867732A}"
+    vgaSave = hp_ccs.Control.VIDEO[vgaSave_id]["0000"]
+    vgaSave["DefaultSettings.XResolution"] = 1440
+    vgaSave["DefaultSettings.YResolution"] = 900
 
     # TODO: needed from WinXP SP3 CD D:\i386\
     # SP3.CAB (17748719 bytes, md5 3c10b0c178a26a6d8e96a2f70a32c9da).
     # Extract it to C:\Windows\ServicePackInstallation\i386\.
     # usbuhci.sys
     # RTL8139.sys
+    # hidusb.sys
     # DRIVER.CAB (62540124 bytes, md5 34f823a3c125fb81d3d77e9ebe865a1d)
     # Extract is to C:\Windows\Driver Cache\i386\.
     # mouhid.sys
+    if win_iso:
+        m.copy_to_windir("/wincd/i386/sp3.cab", "Driver Cache/i386/sp3.cab")
+        m.copy_to_windir("/wincd/i386/driver.cab", "Driver Cache/i386/driver.cab")
 
     # If in test-mode, create registry entries below some other entry
     if testing:
@@ -428,6 +471,13 @@ def main(win_disk_image, virtio_iso, testing, overwrite_files):
     m.import_win_reg("system", handle=system_hive,
             modify_handle=mod_system_hive)
 
+    if extra_files:
+        dest_dir = m.win_root + "/Documents and Settings/All Users/Desktop"
+        for extra_file in extra_files:
+            dst = "{}/{}".format(dest_dir, os.path.basename(extra_file))
+            _logger.debug("Uploading '{}' -> '{}'".format(extra_file, dst))
+            m.g.upload(extra_file, dst)
+
 _verbosities = [
     logging.CRITICAL,
     logging.ERROR,
@@ -439,12 +489,17 @@ parser = argparse.ArgumentParser(
        description="Prepares a Windows disk image for QEMU")
 parser.add_argument("win_disk_image",
                     help="Windows disk image (qcow2 recommended)")
+parser.add_argument("extra_files", nargs="*",
+                    help="Additional files to copy to the desktop")
 parser.add_argument("--virtio-iso",
                     default="/media/DEBIAN/qemu/virtio-win-0.1-81.iso",
                     help="VirtIO driver CD image (see \
                     http://alt.fedoraproject.org/pub/alt/virtio-win/, \
                     defaults to %(default)s)")
-parser.add_argument("-o", "--overwrite", default=False, action="store_true",
+parser.add_argument("-w", "--win-iso",
+                    help="Windows installation CD image")
+parser.add_argument("-o", "--overwrite-files", default=False,
+                    action="store_true",
                     help="Overwrite files during driver installation")
 parser.add_argument("-v", "--verbose", action="count",
                     default=_verbosities.index(logging.WARNING),
@@ -457,4 +512,10 @@ if __name__ == "__main__":
     args.verbose = min(args.verbose, len(_verbosities) - 1)
     #_logger.setLevel(_verbosities[args.verbose])
     logging.basicConfig(level=_verbosities[args.verbose])
-    main(args.win_disk_image, args.virtio_iso, args.testing, args.overwrite)
+    # Hide some args
+    main_args = {
+        k: v for k, v in vars(args).items() if not k in (
+            'verbose'
+        )
+    }
+    main(**main_args)
